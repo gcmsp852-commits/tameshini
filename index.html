@@ -333,6 +333,8 @@
         let isProcessing = false;
         let matrixRawHitCount = 0;
         let matrixLastFinderScore = 0;
+        let matrixFrameCount = 0;
+        let matrixAppMasks = null;
         let sysEncStage3 = false; // 通常モードでシステム暗号化の第2QR探索中フラグ
         let digitalSignStage3 = false; // 電子署名モードの第2QR（もしくはペア）探索中フラグ
         let lastTwinBBox = null; // ★ Stage 1で検出したツインQRの領域を保存
@@ -931,6 +933,8 @@
             appMask = null;
             matrixRawHitCount = 0;
             matrixLastFinderScore = 0;
+            matrixFrameCount = 0;
+            matrixAppMasks = null;
             document.getElementById('headerText').innerText = 'QR Matrix Reader (Normal)';
             startCamera();
         });
@@ -940,6 +944,8 @@
             appMask = null;
             matrixRawHitCount = 0;
             matrixLastFinderScore = 0;
+            matrixFrameCount = 0;
+            matrixAppMasks = null;
             digitalSignStage3 = false;
             document.getElementById('headerText').innerText = 'QR Matrix Reader (Digital Sign)';
             startCamera();
@@ -1025,12 +1031,20 @@
                 : (firstQR && firstQR.creationDateTimeExt32 != null ? firstQR.creationDateTimeExt32 : null);
 
             if (creationDateTimeSource == null && isQRMatrixMode()) {
-                const dtText = prompt('QR Matrix user encryption uses password + creation time. Enter creation time if known (YYYY/MM/DD HH:mm:ss), or leave blank to try password only.', '');
+                const dtText = prompt('QR Matrix user encryption needs the generator creation time (YYYY/MM/DD HH:mm:ss). The reader will also try +/-20 seconds.', formatDateForCreationPrompt());
                 creationDateTimeSource = parseCreationDateTimeInputToExt32(dtText);
+                if (creationDateTimeSource == null) {
+                    alert('Creation time is required for QR Matrix user encryption.');
+                    showPasswordScreen('QR Matrix Data Matrix', 'QR Matrix user encryption password required');
+                    return;
+                }
             }
 
             // 作成日時32ビットがある場合は「パスワード+作成日時4バイト」でマスク生成
-            if (creationDateTimeSource != null) {
+            if (isQRMatrixMode() && creationDateTimeSource != null) {
+                matrixAppMasks = await deriveMatrixAppMaskCandidates(pw, creationDateTimeSource, 20);
+                appMask = matrixAppMasks && matrixAppMasks.length ? matrixAppMasks[0] : null;
+            } else if (creationDateTimeSource != null) {
                 const pwBytes = new TextEncoder().encode(pw);
                 const dt = creationDateTimeSource;
                 const dtBytes = new Uint8Array(4);
@@ -1043,6 +1057,7 @@
                 combined.set(dtBytes, pwBytes.length);
                 appMask = await deriveEncryptionMaskBytesFromInputAsync(combined, 5000);
             } else {
+                matrixAppMasks = null;
                 appMask = await deriveEncryptionMaskBytesAsync(pw, 5000);
             }
 
@@ -1303,6 +1318,8 @@
             appMask = null;
             matrixRawHitCount = 0;
             matrixLastFinderScore = 0;
+            matrixFrameCount = 0;
+            matrixAppMasks = null;
             resetColorScanResult();
             sysEncStage3 = false;
             digitalSignStage3 = false;
@@ -1331,6 +1348,8 @@
             appMask = null;
             matrixRawHitCount = 0;
             matrixLastFinderScore = 0;
+            matrixFrameCount = 0;
+            matrixAppMasks = null;
             resetColorScanResult();
             sysEncStage3 = false;
             digitalSignStage3 = false;
@@ -3706,7 +3725,8 @@
                 codewords: dm.codewords,
                 dataBytes: dm.dataBytes,
                 symbolSize: dm.symbolSize,
-                finderScore: dm.finderScore
+                finderScore: dm.finderScore,
+                source: dm.sample && dm.sample.source ? dm.sample.source : (dm.nativeBarcode ? 'native-data-matrix' : (dm.fallbackDetector ? 'fallback-data-matrix' : 'data-matrix'))
             };
         }
 
@@ -3764,6 +3784,16 @@
             return true;
         }
 
+        function isPlausibleMatrixDMResult(dm) {
+            if (!dm || dm.isRaw) return false;
+            if (dm.managementCode32 === undefined || dm.managementCode32 === null) return false;
+            const mgmtInfo = parseStandardMgmt(dm.managementCode32, dm.managementFlags16);
+            if (!mgmtInfo || mgmtInfo.qrNo !== 0) return false;
+            if ((dm.finderScore || 0) < 0.70) return false;
+            if (dm.text === undefined || dm.text === null) return false;
+            return true;
+        }
+
         function isMatrixSignatureText(text) {
             if (!text) return false;
             try { return atob(String(text)).length === 42; } catch (e) { return false; }
@@ -3809,13 +3839,70 @@
             if (!value) return null;
             const m = String(value).trim().match(/^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
             if (!m) return null;
-            const year = Math.max(2026, Math.min(2041, parseInt(m[1], 10)));
-            const month = Math.max(1, Math.min(12, parseInt(m[2], 10)));
-            const day = Math.max(1, Math.min(31, parseInt(m[3], 10)));
-            const hour = Math.max(0, Math.min(23, parseInt(m[4] || '0', 10)));
-            const minute = Math.max(0, Math.min(59, parseInt(m[5] || '0', 10)));
-            const second = Math.max(0, Math.min(59, parseInt(m[6] || '0', 10)));
+            const year = parseInt(m[1], 10);
+            const month = parseInt(m[2], 10);
+            const day = parseInt(m[3], 10);
+            const hour = parseInt(m[4] || '0', 10);
+            const minute = parseInt(m[5] || '0', 10);
+            const second = parseInt(m[6] || '0', 10);
+            return buildCreationDateTimeExt32FromDate(new Date(year, month - 1, day, hour, minute, second));
+        }
+
+        function buildCreationDateTimeExt32FromDate(date) {
+            const year = Math.max(2026, Math.min(2041, date.getFullYear()));
+            const month = Math.max(1, Math.min(12, date.getMonth() + 1));
+            const day = Math.max(1, Math.min(31, date.getDate()));
+            const hour = Math.max(0, Math.min(23, date.getHours()));
+            const minute = Math.max(0, Math.min(59, date.getMinutes()));
+            const second = Math.max(0, Math.min(59, date.getSeconds()));
             return ((((year - 2026) & 0xF) << 28) | ((month & 0xF) << 24) | ((day & 0x1F) << 19) | ((hour & 0x1F) << 14) | ((minute & 0x3F) << 8) | ((second & 0x3F) << 2)) >>> 0;
+        }
+
+        function dateFromCreationDateTimeExt32(value) {
+            const year = ((value >>> 28) & 0xF) + 2026;
+            const month = (value >>> 24) & 0xF;
+            const day = (value >>> 19) & 0x1F;
+            const hour = (value >>> 14) & 0x1F;
+            const minute = (value >>> 8) & 0x3F;
+            const second = (value >>> 2) & 0x3F;
+            return new Date(year, Math.max(1, month) - 1, Math.max(1, day), hour, minute, second);
+        }
+
+        function formatDateForCreationPrompt(date = new Date()) {
+            const pad = n => String(n).padStart(2, '0');
+            return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        }
+
+        function makeOffsetSecondsOrder(radius) {
+            const out = [0];
+            for (let i = 1; i <= radius; i++) {
+                out.push(-i, i);
+            }
+            return out;
+        }
+
+        async function deriveMatrixAppMaskCandidates(password, centerExt32, radiusSeconds = 20) {
+            const baseDate = dateFromCreationDateTimeExt32(centerExt32);
+            const pwBytes = new TextEncoder().encode(password);
+            const masks = [];
+            const seen = new Set();
+            const offsets = makeOffsetSecondsOrder(radiusSeconds);
+            for (const offset of offsets) {
+                const d = new Date(baseDate.getTime() + offset * 1000);
+                const ext32 = buildCreationDateTimeExt32FromDate(d);
+                if (seen.has(ext32)) continue;
+                seen.add(ext32);
+                const dtBytes = new Uint8Array(4);
+                dtBytes[0] = (ext32 >>> 24) & 0xFF;
+                dtBytes[1] = (ext32 >>> 16) & 0xFF;
+                dtBytes[2] = (ext32 >>> 8) & 0xFF;
+                dtBytes[3] = ext32 & 0xFF;
+                const combined = new Uint8Array(pwBytes.length + 4);
+                combined.set(pwBytes);
+                combined.set(dtBytes, pwBytes.length);
+                masks.push(await deriveEncryptionMaskBytesFromInputAsync(combined, 5000));
+            }
+            return masks;
         }
 
         async function processQRMatrixFrame(imageData, width, height) {
@@ -3824,10 +3911,10 @@
                 return false;
             }
 
+            matrixFrameCount++;
             const candidates = collectQRMatrixCandidates(imageData, width, height);
             const nativeQrs = await collectNativeQRCandidates();
             for (const qr of nativeQrs) candidates.push(qr);
-            const nativeDataMatrices = await collectNativeDataMatrixResults(imageData, width, height);
 
             if (firstQR) {
                 const q2 = findMatrixSecondQR(candidates, scanMode === 'matrix_digital_sign');
@@ -3847,27 +3934,43 @@
 
             let dmResult = null;
             let bestRaw = null;
-            const dmOptions = { minFinderScore: 0.62, appEncMask: appMask ? Array.from(appMask) : null };
-
-            for (const dm of nativeDataMatrices) {
-                if (!dm) continue;
-                if (!dm.isRaw) {
-                    dmResult = dm;
-                    break;
-                }
-                if (!bestRaw || (dm.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = dm;
-            }
+            const maskCandidates = matrixAppMasks && matrixAppMasks.length
+                ? matrixAppMasks
+                : (appMask ? [appMask] : [null]);
 
             for (const qr of expandQRDimensionCandidates(candidates)) {
                 if (dmResult) break;
-                let decoded = null;
-                try { decoded = jsQR.decodeQRMatrix(imageData.data, width, height, qr, dmOptions); } catch (e) { decoded = null; }
-                if (!decoded) continue;
-                if (!decoded.isRaw) {
-                    dmResult = decoded;
-                    break;
+                for (const maskCandidate of maskCandidates) {
+                    let decoded = null;
+                    try {
+                        decoded = jsQR.decodeQRMatrix(imageData.data, width, height, qr, {
+                            minFinderScore: 0.62,
+                            appEncMask: maskCandidate ? Array.from(maskCandidate) : null
+                        });
+                    } catch (e) { decoded = null; }
+                    if (!decoded) continue;
+                    if (isPlausibleMatrixDMResult(decoded)) {
+                        dmResult = decoded;
+                        if (maskCandidate) appMask = maskCandidate;
+                        break;
+                    }
+                    if (!bestRaw || (decoded.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = decoded;
                 }
-                if (!bestRaw || (decoded.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = decoded;
+            }
+
+            if (!dmResult) {
+                const shouldRunStandaloneDM = candidates.length === 0 || matrixFrameCount <= 2 || (matrixFrameCount % 4 === 0);
+                if (shouldRunStandaloneDM) {
+                    const nativeDataMatrices = await collectNativeDataMatrixResults(imageData, width, height);
+                    for (const dm of nativeDataMatrices) {
+                        if (!dm) continue;
+                        if (isPlausibleMatrixDMResult(dm)) {
+                            dmResult = dm;
+                            break;
+                        }
+                        if (dm.isRaw && (!bestRaw || (dm.finderScore || 0) > (bestRaw.finderScore || 0))) bestRaw = dm;
+                    }
+                }
             }
 
             if (!dmResult) {
