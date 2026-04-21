@@ -10928,17 +10928,39 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         return out;
     }
 
+    function rotateCellsCW(cells) {
+        var n = cells.length;
+        var out = [];
+        for (var r = 0; r < n; r++) {
+            out[r] = [];
+            for (var c = 0; c < n; c++) out[r][c] = cells[n - 1 - c][r] ? 1 : 0;
+        }
+        return out;
+    }
+
     function decodeDataMatrixCells(cells, options) {
         options = options || {};
         if (!cells || !cells.length || cells.length !== cells[0].length) return null;
         var symbol = getSymbolBySize(cells.length);
         if (!symbol) return null;
-        var normal = normalizeCells(cells);
-        var inverted = invertCells(normal);
-        var scoreNormal = scoreDataMatrixFinder(normal, symbol);
-        var scoreInverted = scoreDataMatrixFinder(inverted, symbol);
-        var workCells = scoreInverted > scoreNormal ? inverted : normal;
-        var finderScore = Math.max(scoreNormal, scoreInverted);
+        var base = normalizeCells(cells);
+        var bestVariant = null;
+        var rotated = base;
+        for (var rot = 0; rot < 4; rot++) {
+            var normal = rotated;
+            var inverted = invertCells(normal);
+            var scoreNormal = scoreDataMatrixFinder(normal, symbol);
+            var scoreInverted = scoreDataMatrixFinder(inverted, symbol);
+            if (!bestVariant || scoreNormal > bestVariant.score) {
+                bestVariant = { cells: normal, score: scoreNormal, rotation: rot, inverted: false };
+            }
+            if (!bestVariant || scoreInverted > bestVariant.score) {
+                bestVariant = { cells: inverted, score: scoreInverted, rotation: rot, inverted: true };
+            }
+            rotated = rotateCellsCW(rotated);
+        }
+        var workCells = bestVariant.cells;
+        var finderScore = bestVariant.score;
         if (options.minFinderScore && finderScore < options.minFinderScore) {
             return { isRaw: true, finderScore: finderScore, symbolSize: symbol.size };
         }
@@ -10991,6 +11013,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
             dataBytes: corrected.dataCodewords,
             symbolSize: symbol.size,
             finderScore: finderScore,
+            rotation: bestVariant.rotation,
+            inverted: bestVariant.inverted,
             isDataMatrix: true
         };
     }
@@ -11121,6 +11145,100 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         return (low + high) / 2;
     }
 
+    function orderQuadPoints(points) {
+        if (!points || points.length < 4) return null;
+        var pts = points.slice(0, 4).map(function(p) { return { x: Number(p.x), y: Number(p.y) }; });
+        pts.sort(function(a, b) { return (a.x + a.y) - (b.x + b.y); });
+        var tl = pts[0];
+        var br = pts[3];
+        var mid = [pts[1], pts[2]].sort(function(a, b) { return (a.x - a.y) - (b.x - b.y); });
+        var bl = mid[0];
+        var tr = mid[1];
+        return [tl, tr, br, bl];
+    }
+
+    function makeQuadProjector(quad) {
+        var ordered = orderQuadPoints(quad);
+        if (!ordered) return null;
+        var t = squareToQuad(ordered[0], ordered[1], ordered[2], ordered[3]);
+        if (!t) return null;
+        return function(x, y) {
+            var d = t.a13 * x + t.a23 * y + t.a33;
+            return {
+                x: (t.a11 * x + t.a21 * y + t.a31) / d,
+                y: (t.a12 * x + t.a22 * y + t.a32) / d
+            };
+        };
+    }
+
+    function sampleNormalizedModuleLuma(data, width, height, project, x, y, step) {
+        var p0 = project(x, y);
+        var p1 = project(x + step, y);
+        var p2 = project(x - step, y);
+        var p3 = project(x, y + step);
+        var p4 = project(x, y - step);
+        return median5(
+            lumaAt(data, width, height, p0.x, p0.y),
+            lumaAt(data, width, height, p1.x, p1.y),
+            lumaAt(data, width, height, p2.x, p2.y),
+            lumaAt(data, width, height, p3.x, p3.y),
+            lumaAt(data, width, height, p4.x, p4.y)
+        );
+    }
+
+    function sampleDataMatrixFromQuad(imageData, width, height, quad, dmSize, pad) {
+        var project = makeQuadProjector(quad);
+        if (!project) return null;
+        var values = [];
+        var cells = [];
+        var span = 1 - pad * 2;
+        var step = Math.max(0.001, 0.18 * span / dmSize);
+        for (var r = 0; r < dmSize; r++) {
+            cells[r] = [];
+            for (var c = 0; c < dmSize; c++) {
+                var x = pad + (c + 0.5) * span / dmSize;
+                var y = pad + (r + 0.5) * span / dmSize;
+                var lum = sampleNormalizedModuleLuma(imageData, width, height, project, x, y, step);
+                cells[r][c] = lum;
+                values.push(lum);
+            }
+        }
+        var threshold = thresholdForValues(values);
+        var bits = [];
+        for (var rr = 0; rr < dmSize; rr++) {
+            bits[rr] = [];
+            for (var cc = 0; cc < dmSize; cc++) bits[rr][cc] = cells[rr][cc] < threshold ? 1 : 0;
+        }
+        return { cells: bits, threshold: threshold, pad: pad };
+    }
+
+    function decodeDataMatrixFromQuad(imageData, width, height, quad, options) {
+        options = options || {};
+        var sizes = [];
+        if (options.dmSize && getSymbolBySize(options.dmSize)) {
+            sizes = [options.dmSize];
+        } else {
+            for (var si = 0; si < DM_SYMBOLS.length; si++) sizes.push(DM_SYMBOLS[si].size);
+        }
+        var pads = options.pads || [0, 0.025, 0.05, 0.075, 0.10, -0.015];
+        var bestRaw = null;
+        for (var pi = 0; pi < pads.length; pi++) {
+            for (var i = 0; i < sizes.length; i++) {
+                var sample = sampleDataMatrixFromQuad(imageData, width, height, quad, sizes[i], pads[pi]);
+                if (!sample) continue;
+                var decoded = decodeDataMatrixCells(sample.cells, {
+                    appEncMask: options.appEncMask,
+                    minFinderScore: options.minFinderScore || 0.60
+                });
+                if (!decoded) continue;
+                decoded.sample = { threshold: sample.threshold, pad: sample.pad, source: "quad" };
+                if (!decoded.isRaw) return decoded;
+                if (!bestRaw || (decoded.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = decoded;
+            }
+        }
+        return bestRaw;
+    }
+
     function sampleQRMatrixDataMatrix(imageData, width, height, qr, dmSize) {
         var nqr = getQrDimension(qr);
         if (!nqr) return null;
@@ -11199,8 +11317,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
 
     api.decodeDataMatrixCells = decodeDataMatrixCells;
+    api.decodeDataMatrixFromQuad = decodeDataMatrixFromQuad;
     api.decodeQRMatrix = decodeQRMatrix;
     api.sampleQRMatrixDataMatrix = sampleQRMatrixDataMatrix;
+    api.sampleDataMatrixFromQuad = sampleDataMatrixFromQuad;
     api.scoreDataMatrixFinder = scoreDataMatrixFinder;
     api.QR_MATRIX_DM_SYMBOLS = DM_SYMBOLS.slice(0);
 

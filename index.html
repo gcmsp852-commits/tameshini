@@ -561,10 +561,14 @@
         let newColorScanResult = null;
 
         let barcodeDetector = null;
+        let dataMatrixDetector = null;
         if ('BarcodeDetector' in window) {
             try {
                 barcodeDetector = new BarcodeDetector({ formats: ['qr_code'] });
             } catch (e) { console.warn("BarcodeDetector error", e); }
+            try {
+                dataMatrixDetector = new BarcodeDetector({ formats: ['data_matrix'] });
+            } catch (e) { console.warn("DataMatrix BarcodeDetector unsupported", e); }
         }
 
         // --- SHA-256 Implementation (Same as Generator) ---
@@ -3421,6 +3425,246 @@
             return cx + ':' + cy + ':' + (qr.dimension || '') + ':' + (qr.isRaw ? 'raw' : (qr.data || ''));
         }
 
+        function orderedQuadFromPoints(points) {
+            if (!points || points.length < 4) return null;
+            const pts = Array.from(points).slice(0, 4).map(p => ({ x: Number(p.x), y: Number(p.y) }));
+            pts.sort((a, b) => (a.x + a.y) - (b.x + b.y));
+            const tl = pts[0];
+            const br = pts[3];
+            const mid = [pts[1], pts[2]].sort((a, b) => (a.x - a.y) - (b.x - b.y));
+            return [tl, mid[1], br, mid[0]];
+        }
+
+        function quadFromNativeBarcode(barcode) {
+            if (barcode && barcode.cornerPoints && barcode.cornerPoints.length >= 4) {
+                return orderedQuadFromPoints(barcode.cornerPoints);
+            }
+            const box = barcode && barcode.boundingBox;
+            if (!box) return null;
+            return [
+                { x: box.x, y: box.y },
+                { x: box.x + box.width, y: box.y },
+                { x: box.x + box.width, y: box.y + box.height },
+                { x: box.x, y: box.y + box.height }
+            ];
+        }
+
+        function qrCandidateFromNativeBarcode(barcode) {
+            const quad = quadFromNativeBarcode(barcode);
+            if (!quad) return null;
+            return {
+                data: barcode.rawValue || '',
+                text: barcode.rawValue || '',
+                isRaw: false,
+                nativeBarcode: true,
+                location: {
+                    topLeftCorner: quad[0],
+                    topRightCorner: quad[1],
+                    bottomRightCorner: quad[2],
+                    bottomLeftCorner: quad[3]
+                }
+            };
+        }
+
+        async function collectNativeQRCandidates() {
+            const out = [];
+            if (!barcodeDetector) return out;
+            try {
+                const barcodes = await barcodeDetector.detect(zxingCanvas);
+                for (const b of (barcodes || [])) {
+                    const candidate = qrCandidateFromNativeBarcode(b);
+                    if (candidate) out.push(candidate);
+                }
+            } catch (e) {}
+            return out;
+        }
+
+        async function collectNativeDataMatrixResults(imageData, width, height) {
+            const out = [];
+            if (!jsQR.decodeDataMatrixFromQuad) return out;
+            try {
+                if (!dataMatrixDetector) throw new Error('native data_matrix detector unavailable');
+                const barcodes = await dataMatrixDetector.detect(zxingCanvas);
+                for (const b of (barcodes || [])) {
+                    const quad = quadFromNativeBarcode(b);
+                    if (!quad) continue;
+                    let decoded = null;
+                    try {
+                        decoded = jsQR.decodeDataMatrixFromQuad(imageData.data, width, height, quad, {
+                            appEncMask: appMask ? Array.from(appMask) : null,
+                            minFinderScore: 0.60
+                        });
+                    } catch (e) {
+                        decoded = null;
+                    }
+                    if (decoded) {
+                        decoded.nativeBarcode = true;
+                        decoded.nativeRawValue = b.rawValue || '';
+                        out.push(decoded);
+                    } else if (b.rawValue) {
+                        out.push({
+                            text: b.rawValue,
+                            data: b.rawValue,
+                            binaryData: [],
+                            codewords: [],
+                            dataBytes: [],
+                            isDataMatrix: true,
+                            nativeBarcode: true,
+                            nativeRawValue: b.rawValue,
+                            finderScore: 1
+                        });
+                    }
+                }
+            } catch (e) {}
+            if (out.some(dm => dm && !dm.isRaw)) return out;
+            return out.concat(collectFallbackDataMatrixResults(imageData, width, height));
+        }
+
+        function otsuThresholdFromImage(data, width, height) {
+            const hist = new Array(256).fill(0);
+            const step = Math.max(1, Math.floor(Math.sqrt(width * height / 12000)));
+            let total = 0;
+            for (let y = 0; y < height; y += step) {
+                for (let x = 0; x < width; x += step) {
+                    const idx = (y * width + x) * 4;
+                    const lum = (data[idx] * 54 + data[idx + 1] * 183 + data[idx + 2] * 19) >> 8;
+                    hist[lum]++;
+                    total++;
+                }
+            }
+            let sum = 0;
+            for (let i = 0; i < 256; i++) sum += i * hist[i];
+            let sumB = 0, wB = 0, maxVar = -1, threshold = 128;
+            for (let t = 0; t < 256; t++) {
+                wB += hist[t];
+                if (wB === 0) continue;
+                const wF = total - wB;
+                if (wF === 0) break;
+                sumB += t * hist[t];
+                const mB = sumB / wB;
+                const mF = (sum - sumB) / wF;
+                const between = wB * wF * (mB - mF) * (mB - mF);
+                if (between > maxVar) {
+                    maxVar = between;
+                    threshold = t;
+                }
+            }
+            return Math.max(60, Math.min(210, threshold));
+        }
+
+        function collectFallbackDataMatrixResults(imageData, width, height) {
+            if (!jsQR.decodeDataMatrixFromQuad) return [];
+            const data = imageData.data;
+            const maxGrid = 220;
+            const scale = Math.max(width, height) / maxGrid;
+            const gw = Math.max(40, Math.ceil(width / scale));
+            const gh = Math.max(40, Math.ceil(height / scale));
+            const threshold = otsuThresholdFromImage(data, width, height);
+            const occ = new Uint8Array(gw * gh);
+            for (let gy = 0; gy < gh; gy++) {
+                const y = Math.min(height - 1, Math.floor((gy + 0.5) * height / gh));
+                for (let gx = 0; gx < gw; gx++) {
+                    const x = Math.min(width - 1, Math.floor((gx + 0.5) * width / gw));
+                    const idx = (y * width + x) * 4;
+                    const lum = (data[idx] * 54 + data[idx + 1] * 183 + data[idx + 2] * 19) >> 8;
+                    if (lum < threshold) occ[gy * gw + gx] = 1;
+                }
+            }
+
+            let work = occ;
+            for (let iter = 0; iter < 2; iter++) {
+                const dil = new Uint8Array(gw * gh);
+                for (let y = 0; y < gh; y++) {
+                    for (let x = 0; x < gw; x++) {
+                        if (!work[y * gw + x]) continue;
+                        for (let dy = -1; dy <= 1; dy++) {
+                            for (let dx = -1; dx <= 1; dx++) {
+                                const nx = x + dx, ny = y + dy;
+                                if (nx >= 0 && nx < gw && ny >= 0 && ny < gh) dil[ny * gw + nx] = 1;
+                            }
+                        }
+                    }
+                }
+                work = dil;
+            }
+
+            const seen = new Uint8Array(gw * gh);
+            const components = [];
+            for (let sy = 0; sy < gh; sy++) {
+                for (let sx = 0; sx < gw; sx++) {
+                    const start = sy * gw + sx;
+                    if (!work[start] || seen[start]) continue;
+                    const qx = [sx], qy = [sy];
+                    seen[start] = 1;
+                    let head = 0, count = 0, minX = sx, maxX = sx, minY = sy, maxY = sy;
+                    while (head < qx.length) {
+                        const x = qx[head], y = qy[head++];
+                        count++;
+                        if (x < minX) minX = x; if (x > maxX) maxX = x;
+                        if (y < minY) minY = y; if (y > maxY) maxY = y;
+                        const neigh = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]];
+                        for (const [nx, ny] of neigh) {
+                            if (nx < 0 || nx >= gw || ny < 0 || ny >= gh) continue;
+                            const ni = ny * gw + nx;
+                            if (work[ni] && !seen[ni]) {
+                                seen[ni] = 1;
+                                qx.push(nx); qy.push(ny);
+                            }
+                        }
+                    }
+                    const bw = maxX - minX + 1;
+                    const bh = maxY - minY + 1;
+                    if (count < 24 || bw < 8 || bh < 8) continue;
+                    const aspect = bw / bh;
+                    if (aspect < 0.55 || aspect > 1.85) continue;
+                    components.push({ minX, maxX, minY, maxY, area: bw * bh });
+                }
+            }
+
+            components.sort((a, b) => b.area - a.area);
+            const results = [];
+            for (let i = 0; i < Math.min(8, components.length); i++) {
+                const c = components[i];
+                const pad = 3;
+                const x0 = Math.max(0, (c.minX - pad) * width / gw);
+                const y0 = Math.max(0, (c.minY - pad) * height / gh);
+                const x1 = Math.min(width, (c.maxX + 1 + pad) * width / gw);
+                const y1 = Math.min(height, (c.maxY + 1 + pad) * height / gh);
+                const quad = [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
+                let decoded = null;
+                try {
+                    decoded = jsQR.decodeDataMatrixFromQuad(data, width, height, quad, {
+                        appEncMask: appMask ? Array.from(appMask) : null,
+                        minFinderScore: 0.62,
+                        pads: [0.05, 0.08, 0.11, 0.14, 0.02, 0]
+                    });
+                } catch (e) {
+                    decoded = null;
+                }
+                if (decoded) {
+                    decoded.fallbackDetector = true;
+                    results.push(decoded);
+                    if (!decoded.isRaw) break;
+                }
+            }
+            return results;
+        }
+
+        function expandQRDimensionCandidates(candidates) {
+            const out = [];
+            for (const qr of candidates) {
+                if (!qr || !qr.location) continue;
+                if (qr.dimension || qr.version) {
+                    out.push(qr);
+                    continue;
+                }
+                for (let v = 1; v <= 40; v++) {
+                    out.push({ ...qr, dimension: 17 + 4 * v });
+                }
+            }
+            return out;
+        }
+
         function collectQRMatrixCandidates(imageData, width, height) {
             const passes = [
                 { inversionAttempts: 'attemptBoth', multi: true, extractRawForFailed: true, singleLocate: false },
@@ -3581,6 +3825,9 @@
             }
 
             const candidates = collectQRMatrixCandidates(imageData, width, height);
+            const nativeQrs = await collectNativeQRCandidates();
+            for (const qr of nativeQrs) candidates.push(qr);
+            const nativeDataMatrices = await collectNativeDataMatrixResults(imageData, width, height);
 
             if (firstQR) {
                 const q2 = findMatrixSecondQR(candidates, scanMode === 'matrix_digital_sign');
@@ -3602,7 +3849,17 @@
             let bestRaw = null;
             const dmOptions = { minFinderScore: 0.62, appEncMask: appMask ? Array.from(appMask) : null };
 
-            for (const qr of candidates) {
+            for (const dm of nativeDataMatrices) {
+                if (!dm) continue;
+                if (!dm.isRaw) {
+                    dmResult = dm;
+                    break;
+                }
+                if (!bestRaw || (dm.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = dm;
+            }
+
+            for (const qr of expandQRDimensionCandidates(candidates)) {
+                if (dmResult) break;
                 let decoded = null;
                 try { decoded = jsQR.decodeQRMatrix(imageData.data, width, height, qr, dmOptions); } catch (e) { decoded = null; }
                 if (!decoded) continue;
