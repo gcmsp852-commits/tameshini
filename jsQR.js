@@ -10736,6 +10736,32 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         return byte & 0xFF;
     }
 
+    function dmMarkModule(occupied, nrow, ncol, row, col) {
+        var r = row, c = col;
+        if (r < 0) { r += nrow; c += 4 - ((nrow + 4) % 8); }
+        if (c < 0) { c += ncol; r += 4 - ((ncol + 4) % 8); }
+        if (r < 0 || r >= nrow || c < 0 || c >= ncol) return;
+        occupied[r][c] = true;
+    }
+
+    function dmMarkUtah(occupied, nrow, ncol, row, col) {
+        var coords = [
+            [row - 2, col - 2], [row - 2, col - 1],
+            [row - 1, col - 2], [row - 1, col - 1], [row - 1, col],
+            [row, col - 2], [row, col - 1], [row, col]
+        ];
+        for (var i = 0; i < coords.length; i++) {
+            dmMarkModule(occupied, nrow, ncol, coords[i][0], coords[i][1]);
+        }
+    }
+
+    function dmMarkDirectBits(occupied, coords) {
+        for (var i = 0; i < coords.length; i++) {
+            var r = coords[i][0], c = coords[i][1];
+            if (occupied[r]) occupied[r][c] = true;
+        }
+    }
+
     function dmReadCorner1(array, nrow, ncol) {
         return dmReadDirectBits(array, [[nrow - 1,0],[nrow - 1,1],[nrow - 1,2],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1],[2,ncol - 1],[3,ncol - 1]]);
     }
@@ -10751,27 +10777,43 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
     function dmReadCodewordsFromMapping(mapping, nrow, ncol, totalCodewords) {
         var codewords = [];
+        var occupied = [];
+        for (var rr = 0; rr < nrow; rr++) occupied[rr] = new Array(ncol).fill(false);
         var row = 4;
         var col = 0;
         do {
             if (row === nrow && col === 0) {
-                codewords.push(dmReadCorner1(mapping, nrow, ncol));
+                var corner1 = [[nrow - 1,0],[nrow - 1,1],[nrow - 1,2],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1],[2,ncol - 1],[3,ncol - 1]];
+                codewords.push(dmReadDirectBits(mapping, corner1));
+                dmMarkDirectBits(occupied, corner1);
             } else if (row === nrow - 2 && col === 0 && ncol % 4 !== 0) {
-                codewords.push(dmReadCorner2(mapping, nrow, ncol));
+                var corner2 = [[nrow - 3,0],[nrow - 2,0],[nrow - 1,0],[0,ncol - 4],[0,ncol - 3],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1]];
+                codewords.push(dmReadDirectBits(mapping, corner2));
+                dmMarkDirectBits(occupied, corner2);
             } else if (row === nrow - 2 && col === 0 && ncol % 8 === 4) {
-                codewords.push(dmReadCorner3(mapping, nrow, ncol));
+                var corner3 = [[nrow - 3,0],[nrow - 2,0],[nrow - 1,0],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1],[2,ncol - 1],[3,ncol - 1]];
+                codewords.push(dmReadDirectBits(mapping, corner3));
+                dmMarkDirectBits(occupied, corner3);
             } else if (row === nrow + 4 && col === 2 && ncol % 8 === 0) {
-                codewords.push(dmReadCorner4(mapping, nrow, ncol));
+                var corner4 = [[nrow - 1,0],[nrow - 1,ncol - 1],[0,ncol - 3],[0,ncol - 2],[0,ncol - 1],[1,ncol - 3],[1,ncol - 2],[1,ncol - 1]];
+                codewords.push(dmReadDirectBits(mapping, corner4));
+                dmMarkDirectBits(occupied, corner4);
             }
             do {
-                if (row < nrow && col >= 0) codewords.push(dmReadUtah(mapping, nrow, ncol, row, col));
+                if (row < nrow && col >= 0 && !occupied[row][col]) {
+                    codewords.push(dmReadUtah(mapping, nrow, ncol, row, col));
+                    dmMarkUtah(occupied, nrow, ncol, row, col);
+                }
                 row -= 2;
                 col += 2;
             } while (row >= 0 && col < ncol);
             row += 1;
             col += 3;
             do {
-                if (row >= 0 && col < ncol) codewords.push(dmReadUtah(mapping, nrow, ncol, row, col));
+                if (row >= 0 && col < ncol && !occupied[row][col]) {
+                    codewords.push(dmReadUtah(mapping, nrow, ncol, row, col));
+                    dmMarkUtah(occupied, nrow, ncol, row, col);
+                }
                 row += 2;
                 col -= 2;
             } while (row < nrow && col >= 0);
